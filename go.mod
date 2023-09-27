@@ -1,6 +1,6 @@
-module github.com/nee541/node_energy_exporter
+module github.com/nee541/node_rapl_exporter
 
-go 1.20
+go 1.21
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect

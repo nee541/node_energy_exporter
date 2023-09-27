@@ -1,1 +1,1 @@
-# node_energy_exporter
+# node_rapl_exporter
