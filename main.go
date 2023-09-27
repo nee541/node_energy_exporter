@@ -20,16 +20,18 @@ const (
 
 type raplCollector struct {
 	mu                  sync.Mutex
+	instance            string
 	lastEnergyUj        map[string]float64
 	energyConsumedDelta *prometheus.Desc
 }
 
-func newRaplCollector() *raplCollector {
+func newRaplCollector(instance string) *raplCollector {
 	return &raplCollector{
+		instance: instance,
 		lastEnergyUj: make(map[string]float64),
 		energyConsumedDelta: prometheus.NewDesc("rapl_energy_consumed_delta_uj",
 			"Delta energy consumption in microjoules since last scrape",
-			[]string{"package", "domain"},
+			[]string{"instance", "package", "domain"},
 			nil,
 		),
 	}
@@ -79,7 +81,7 @@ func (collector *raplCollector) Collect(ch chan<- prometheus.Metric) {
 			delta += maxValue
 		}
 		collector.lastEnergyUj[key] = value
-		ch <- prometheus.MustNewConstMetric(collector.energyConsumedDelta, prometheus.GaugeValue, delta, pkgName, "package")
+		ch <- prometheus.MustNewConstMetric(collector.energyConsumedDelta, prometheus.GaugeValue, delta, collector.instance, pkgName, "package")
 
 		// Subdomains
 		domains, _ := os.ReadDir(raplPath + pkgName)
@@ -103,14 +105,19 @@ func (collector *raplCollector) Collect(ch chan<- prometheus.Metric) {
 				delta += maxValue
 			}
 			collector.lastEnergyUj[key] = value
-			ch <- prometheus.MustNewConstMetric(collector.energyConsumedDelta, prometheus.GaugeValue, delta, pkgName, domain.Name())
+			ch <- prometheus.MustNewConstMetric(collector.energyConsumedDelta, prometheus.GaugeValue, delta, collector.instance, pkgName, domain.Name())
 		}
 	}
 }
 
 func main() {
+	hostname, err := os.Hostname()
+	if err != nil {
+		log.Fatalf("Could not get hostname: %v", err)
+	}
+
 	r := prometheus.NewRegistry()
-	r.MustRegister(newRaplCollector())
+	r.MustRegister(newRaplCollector(hostname))
 
 	http.Handle("/metrics", promhttp.HandlerFor(r, promhttp.HandlerOpts{}))
 	http.ListenAndServe(":9100", nil)
