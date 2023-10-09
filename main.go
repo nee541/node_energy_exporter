@@ -1,124 +1,160 @@
 package main
 
 import (
+	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
-	"strings"
-	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/procfs/sysfs"
 )
 
 const (
 	raplPath = "/sys/class/powercap/intel-rapl/"
+	sysPath  = "/sys/"
 )
 
-type raplCollector struct {
-	mu                  sync.Mutex
-	instance            string
-	lastEnergyUj        map[string]float64
-	energyConsumedDelta *prometheus.Desc
+func init() {
+	log.SetOutput(os.Stdout)
 }
 
-func newRaplCollector(instance string) *raplCollector {
-	return &raplCollector{
-		instance: instance,
-		lastEnergyUj: make(map[string]float64),
-		energyConsumedDelta: prometheus.NewDesc("rapl_energy_consumed_delta_uj",
-			"Delta energy consumption in microjoules since last scrape",
-			[]string{"instance", "package", "domain"},
-			nil,
-		),
-	}
+var (
+	ErrNoData       = errors.New("collector returned no data")
+	metricNameRegex = regexp.MustCompile(`_*[^0-9A-Za-z_]+_*`)
+)
+
+type RaplCollector struct {
+	fs               sysfs.FS
+	joulesMetricDesc *prometheus.Desc
 }
 
-func (collector *raplCollector) Describe(ch chan<- *prometheus.Desc) {
-	ch <- collector.energyConsumedDelta
+// SanitizeMetricName sanitize the given metric name by replacing invalid characters by underscores.
+//
+// OpenMetrics and the Prometheus exposition format require the metric name
+// to consist only of alphanumericals and "_", ":" and they must not start
+// with digits. Since colons in MetricFamily are reserved to signal that the
+// MetricFamily is the result of a calculation or aggregation of a general
+// purpose monitoring system, colons will be replaced as well.
+//
+// Note: If not subsequently prepending a namespace and/or subsystem (e.g.,
+// with prometheus.BuildFQName), the caller must ensure that the supplied
+// metricName does not begin with a digit.
+func SanitizeMetricName(metricName string) string {
+	return metricNameRegex.ReplaceAllString(metricName, "_")
 }
 
-func readFileContents(path string) (string, error) {
-	file, err := os.Open(path)
+func NewRaplCollector() (*RaplCollector, error) {
+	fs, err := sysfs.NewFS(sysPath)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	defer file.Close()
-
-	contents, err := io.ReadAll(file)
-	if err != nil {
-		return "", err
+	joulesMetricDesc := prometheus.NewDesc(
+		"node_rapl_joules_total",
+		"Current RAPL value in joules",
+		[]string{"instance", "package", "domain"},
+		nil,
+	)
+	collector := RaplCollector{
+		fs:               fs,
+		joulesMetricDesc: joulesMetricDesc,
 	}
-	return strings.TrimSpace(string(contents)), nil
+	return &collector, nil
 }
 
-func (collector *raplCollector) Collect(ch chan<- prometheus.Metric) {
-	collector.mu.Lock()
-	defer collector.mu.Unlock()
-
-	pkgs, _ := os.ReadDir(raplPath)
-	for _, pkg := range pkgs {
-		pkgName := pkg.Name()
-		if !strings.Contains(pkgName, "intel-rapl:") {
-			continue
+// Update implements Collector and exposes RAPL related metrics.
+func (c *RaplCollector) Update(ch chan<- prometheus.Metric) error {
+	// nil zones are fine when platform doesn't have powercap files present.
+	zones, err := sysfs.GetRaplZones(c.fs)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			log.Println("msg", "Platform doesn't have powercap files present", "err", err)
+			return ErrNoData
 		}
+		if errors.Is(err, os.ErrPermission) {
+			log.Println("msg", "Can't access powercap files", "err", err)
+			return ErrNoData
+		}
+		return fmt.Errorf("failed to retrieve rapl stats: %w", err)
+	}
 
-		pkgEnergy, err := readFileContents(fmt.Sprintf("%s%s/energy_uj", raplPath, pkgName))
+	for _, rz := range zones {
+		microJoules, err := rz.GetEnergyMicrojoules()
 		if err != nil {
-			log.Println("Error reading file:", err)
-			continue
+			if errors.Is(err, os.ErrPermission) {
+				log.Println("msg", "Can't access energy_uj file", "zone", rz, "err", err)
+				return ErrNoData
+			}
+			return err
 		}
 
-		value, _ := strconv.ParseFloat(pkgEnergy, 64)
-		key := fmt.Sprintf("%s-package", pkgName)
-		delta := value - collector.lastEnergyUj[key]
-		if delta < 0 {
-			maxEnergy, _ := readFileContents(fmt.Sprintf("%s%s/max_energy_range_uj", raplPath, pkgName))
-			maxValue, _ := strconv.ParseFloat(maxEnergy, 64)
-			delta += maxValue
-		}
-		collector.lastEnergyUj[key] = value
-		ch <- prometheus.MustNewConstMetric(collector.energyConsumedDelta, prometheus.GaugeValue, delta, collector.instance, pkgName, "package")
+		joules := float64(microJoules) / 1000000.0
 
-		// Subdomains
-		domains, _ := os.ReadDir(raplPath + pkgName)
-		for _, domain := range domains {
-			if !strings.Contains(domain.Name(), "intel-rapl:") {
-				continue
-			}
+		ch <- c.joulesMetric(rz, joules)
+	}
+	return nil
+}
 
-			domainEnergy, err := readFileContents(fmt.Sprintf("%s%s/%s/energy_uj", raplPath, pkgName, domain.Name()))
-			if err != nil {
-				log.Println("Error reading domain file:", err)
-				continue
-			}
+func (c *RaplCollector) joulesMetric(z sysfs.RaplZone, v float64) prometheus.Metric {
+	index := strconv.Itoa(z.Index)
+	descriptor := prometheus.NewDesc(
+		prometheus.BuildFQName(
+			"node",
+			"rapl",
+			fmt.Sprintf("%s_joules_total", SanitizeMetricName(z.Name)),
+		),
+		fmt.Sprintf("Current RAPL %s value in joules", z.Name),
+		[]string{"index", "path"}, nil,
+	)
 
-			value, _ = strconv.ParseFloat(domainEnergy, 64)
-			key = fmt.Sprintf("%s-%s", pkgName, domain.Name())
-			delta = value - collector.lastEnergyUj[key]
-			if delta < 0 {
-				maxEnergy, _ := readFileContents(fmt.Sprintf("%s%s/%s/max_energy_range_uj", raplPath, pkgName, domain.Name()))
-				maxValue, _ := strconv.ParseFloat(maxEnergy, 64)
-				delta += maxValue
-			}
-			collector.lastEnergyUj[key] = value
-			ch <- prometheus.MustNewConstMetric(collector.energyConsumedDelta, prometheus.GaugeValue, delta, collector.instance, pkgName, domain.Name())
-		}
+	return prometheus.MustNewConstMetric(
+		descriptor,
+		prometheus.CounterValue,
+		v,
+		index,
+		z.Path,
+	)
+}
+
+func (c *RaplCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.joulesMetricDesc
+}
+
+func (c *RaplCollector) Collect(ch chan<- prometheus.Metric) {
+	if err := c.Update(ch); err != nil {
+		log.Println("msg", "failed to update rapl stats", "err", err)
 	}
 }
+
+// For testing purposes
+// func iterateOverPowercap() {
+// 	fs, err := sysfs.NewFS(sysPath)
+// 	if err != nil {
+// 		log.Println("msg", "failed to create sysfs", "err", err)
+// 		return
+// 	}
+// 	zones, err := sysfs.GetRaplZones(fs)
+// 	if err != nil {
+// 		log.Println("msg", "failed to retrieve rapl stats", "err", err)
+// 		return
+// 	}
+// 	for _, rz := range zones {
+// 		fmt.Println("name", rz.Name, "sanitized name", SanitizeMetricName(rz.Name), "path", rz.Path, "index", rz.Index)
+// 	}
+// }
 
 func main() {
-	hostname, err := os.Hostname()
+	reg := prometheus.NewRegistry()
+	raplCollector, err := NewRaplCollector()
 	if err != nil {
-		log.Fatalf("Could not get hostname: %v", err)
+		log.Println("NewFS error", err)
 	}
+	reg.MustRegister(raplCollector)
 
-	r := prometheus.NewRegistry()
-	r.MustRegister(newRaplCollector(hostname))
-
-	http.Handle("/metrics", promhttp.HandlerFor(r, promhttp.HandlerOpts{}))
-	http.ListenAndServe(":9100", nil)
+	http.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+	http.ListenAndServe(":9110", nil)
 }
